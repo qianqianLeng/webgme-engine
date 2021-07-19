@@ -1,0 +1,61 @@
+{
+  "id": "PluginGenerator",
+  "name": "Plugin Generator",
+  "version": "2.20.5",
+  "description": "Generates a functional plugin that extends the PluginBase.",
+  "icon": {
+    "src": "",
+    "class": "fa fa-cogs"
+  },
+  "disableServerSideExecution": false,
+  "disableBrowserSideExecution": false,
+  "writeAccessRequired": false,
+  "configStructure": [
+    {
+      "name": "pluginID",
+      "displayName": "Unique plugin identifier",
+      "regex": "^(?!(?:do|if|in|for|let|new|try|var|case|else|enum|eval|false|null|this|true|void|with|break|catch|class|const|super|throw|while|yield|delete|export|import|public|return|static|switch|typeof|default|extends|finally|package|private|continue|debugger|function|arguments|interface|protected|implements|instanceof)$)[a-zA-Z_$][0-9a-zA-Z_$]*",
+      "regexMessage": "No spaces and special characters allowed. This value is used as the name of the generated plugin class.",
+      "description": "Unique ID for the plugin.",
+      "value": "NewPlugin",
+      "valueType": "string",
+      "readOnly": false
+    },
+    {
+      "name": "pluginName",
+      "displayName": "Name",
+      "description": "Short readable plugin name; spaces are allowed",
+      "value": "New Plugin",
+      "valueType": "string",
+      "readOnly": false
+    },
+    {
+      "name": "description",
+      "displayName": "Description",
+      "description": "Optional description of the plugin.",
+      "value": "",
+      "valueType": "string",
+      "readOnly": false
+    },
+    {
+      "name": "language",
+      "displayName": "Programming Language",
+      "description": "Language the generated plugin should target, JavaScript(=default) and Python available",
+      "value": "JavaScript",
+      "valueType": "string",
+      "readOnly": false,
+      "valueItems": [
+        "JavaScript",
+        "Python"
+      ]
+    },
+    {
+      "name": "configStructure",
+      "displayName": "Include Configuration Structure.",
+      "description": "Configuration structure will populate this GUI with controls.",
+      "value": false,
+      "valueType": "boolean",
+      "readOnly": false
+    }
+  ]
+}

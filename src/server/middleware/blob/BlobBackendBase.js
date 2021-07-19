@@ -1,0 +1,325 @@
+/*globals requireJS*/
+/*eslint-env node*/
+
+/**
+ * @author lattmann / https://github.com/lattmann
+ * @author pmeijer / https://github.com/pmeijer
+ */
+
+'use strict';
+
+var fs = require('fs'),
+    mime = require('mime'),
+    archiver = require('archiver'),
+    Q = require('q'),
+
+    GUID = requireJS('common/util/guid'),
+    BlobMetadata = requireJS('blob/BlobMetadata'),
+    BlobConfig = requireJS('blob/BlobConfig'),
+
+    StringStreamReader = require('../../util/StringStreamReader'),
+    StringStreamWriter = require('../../util/StringStreamWriter');
+
+var BlobBackendBase = function (gmeConfig, logger) {
+    if (gmeConfig.blob.namespace) {
+        this.contentBucket = gmeConfig.blob.namespace + '/wg-content';
+        this.metadataBucket = gmeConfig.blob.namespace + '/wg-metadata';
+        this.tempBucket = gmeConfig.blob.namespace + '/wg-temp';
+    } else {
+        this.contentBucket = 'wg-content';
+        this.metadataBucket = 'wg-metadata';
+        this.tempBucket = 'wg-temp';
+    }
+
+    this.gmeConfig = gmeConfig;
+
+    this.shaMethod = BlobConfig.hashMethod;
+    this.logger = logger.fork('BlobBackend');
+};
+
+// -----------------------------------------------------------------------------------------------------------------
+// Must be overridden in derived classes (low-level implementation specific API calls)
+
+BlobBackendBase.prototype.putObject = function (/*readStream, bucket, callback*/) {
+    throw new Error('Not implemented yet.');
+};
+
+BlobBackendBase.prototype.getObject = function (/*hash, writeStream, bucket, callback*/) {
+    throw new Error('Not implemented yet.');
+};
+
+BlobBackendBase.prototype.listObjects = function (/*bucket, callback*/) {
+    throw new Error('Not implemented yet.');
+};
+
+// -----------------------------------------------------------------------------------------------------------------
+// COMMON FUNCTIONALITY
+
+// -----------------------------------------------------------------------------------------------------------------
+// File handling functions
+
+BlobBackendBase.prototype.putFile = function (name, readStream, callback) {
+    // add content to storage
+    // create metadata file (filename, size, object-hash, object-type, content-type)
+    // add metadata to storage
+    // return metadata's hash and content's hash
+
+    // TODO: add tags and isPublic flag
+
+    var self = this;
+
+    if (typeof readStream === 'string') {
+        // if a string is given convert it to a readable stream object
+        readStream = new StringStreamReader(readStream);
+    }
+
+    self.putObject(readStream, self.contentBucket, function (err, hash, length) {
+        if (err) {
+            // failed to save content
+            callback(err);
+            return;
+        }
+
+        var metadata = new BlobMetadata({
+            name: name,
+            size: length,
+            mime: mime.lookup(name),
+            isPublic: false,
+            tags: [],
+            content: hash,
+            contentType: BlobMetadata.CONTENT_TYPES.OBJECT
+        });
+
+        self.putMetadata(metadata, function (err, metadataHash) {
+            if (err) {
+                callback(err);
+                return;
+            }
+
+            callback(null, metadataHash);
+        });
+
+    });
+};
+
+BlobBackendBase.prototype.getFile = function (metadataHash, subpath, writeStream, callback) {
+    if (BlobConfig.hashRegex.test(metadataHash) === false) {
+        callback(new Error('Blob hash is invalid'));
+        return;
+    }
+    // TODO: get metadata
+    // TODO: get all content based on metadata
+    // TODO: write the stream after callback (error, metadata)
+    var self = this;
+
+    var softLinkHashes = [];
+
+    self.getMetadata(metadataHash, function (err, metadataHash, metadata) {
+        if (err) {
+            callback(err);
+            return;
+        }
+
+        var tempFiles = [],
+            contentKeys,
+            archive;
+
+        function addToZipRec() {
+            var subpartName = contentKeys.pop();
+            if (typeof subpartName === 'string') {
+                var subpartHash = metadata.content[subpartName].content,
+                    subpartType = metadata.content[subpartName].contentType,
+                    contentTemp = GUID() + '.tmp',
+                    writeStream2 = fs.createWriteStream(contentTemp),
+                    promise;
+
+                tempFiles.push(contentTemp);
+
+                if (subpartType === BlobMetadata.CONTENT_TYPES.OBJECT) {
+                    promise = Q.ninvoke(self, 'getObject', subpartHash, writeStream2, self.contentBucket);
+                } else if (subpartType === BlobMetadata.CONTENT_TYPES.SOFT_LINK) {
+                    promise = Q.ninvoke(self, 'getFile', subpartHash, '', writeStream2);
+                } else {
+                    // complex part within complex part is not supported
+                    promise = Q.reject(new Error('Subpart content type is not supported: '
+                        + subpartType + ' ' + subpartName + ' ' + subpartHash));
+                }
+
+                return promise.then(function () {
+                    archive.append(fs.createReadStream(contentTemp), {name: subpartName});
+                    addToZipRec();
+                }).catch(function (err) {
+                    callback(err);
+                });
+            } else {
+                // We've gone through all content
+                archive.finalize();
+            }
+        }
+
+        if (metadata.contentType === BlobMetadata.CONTENT_TYPES.OBJECT) {
+            self.getObject(metadata.content, writeStream, self.contentBucket, function (err) {
+                if (err) {
+                    callback(err);
+                    return;
+                }
+
+                callback(null, metadata);
+            });
+
+        } else if (metadata.contentType === BlobMetadata.CONTENT_TYPES.SOFT_LINK) {
+            if (softLinkHashes.indexOf(metadataHash) > -1) {
+                // TODO: concat all soft link hashes
+                callback(new Error('Circular references in softLinks: ' + metadataHash));
+                return;
+            }
+
+            softLinkHashes.push(metadataHash);
+            self.getFile(metadata.content, '', writeStream, callback);
+
+        } else if (metadata.contentType === BlobMetadata.CONTENT_TYPES.COMPLEX) {
+            // 1) create a zip package
+            // 2) add all files from the descriptor to the zip
+            // 3) pipe the zip package to the stream
+
+            if (subpath) {
+                if (metadata.content.hasOwnProperty(subpath)) {
+                    var contentObj = metadata.content[subpath];
+
+                    if (contentObj.contentType === BlobMetadata.CONTENT_TYPES.OBJECT) {
+
+                        self.getObject(contentObj.content, writeStream, self.contentBucket, function (err) {
+                            if (err) {
+                                callback(err);
+                                return;
+                            }
+
+                            callback(null, metadata);
+                        });
+
+                    } else if (contentObj.contentType === BlobMetadata.CONTENT_TYPES.SOFT_LINK) {
+                        self.getFile(contentObj.content, '', writeStream, callback);
+                    } else {
+                        callback(new Error('subpath content type (' + contentObj.contentType +
+                            ') is not supported yet in content: ' + subpath));
+                    }
+                } else {
+                    callback(new Error('subpath does not exist in content: ' + subpath));
+                }
+            } else {
+                // return with the full content as a zip package
+                contentKeys = Object.keys(metadata.content);
+                archive = archiver('zip', {
+                    zlib: {level: self.gmeConfig.blob.compressionLevel}
+                });
+
+                archive.pipe(writeStream);
+
+                archive.on('error', function (err) {
+                    callback(err);
+                });
+
+                archive.on('end', function () {
+                    writeStream.end();
+                    tempFiles.forEach(function (contentTemp) {
+                        fs.unlink(contentTemp, function () {
+                            // FIXME: Do we need to wait for this? And what about errors?
+                        });
+                    });
+                    callback(null, metadata);
+                });
+
+                addToZipRec();
+            }
+        } else {
+            callback(new Error('not supported content type: ' + metadata.contentType));
+        }
+    });
+};
+
+
+// -----------------------------------------------------------------------------------------------------------------
+// Metadata functions
+
+BlobBackendBase.prototype.putMetadata = function (metadata, callback) {
+    var self = this;
+    var stringStream = new StringStreamReader(JSON.stringify(metadata.serialize()));
+
+    self.putObject(stringStream, self.metadataBucket, function (err, metadataHash) {
+        if (err) {
+            // failed to save metadata
+            callback(err);
+            return;
+        }
+
+        callback(null, metadataHash);
+    });
+};
+
+BlobBackendBase.prototype.getMetadata = function (metadataHash, callback) {
+    var self = this,
+        writeStream = new StringStreamWriter();
+
+    self.getObject(metadataHash, writeStream, self.metadataBucket, function (err, fileInfo) {
+        if (err) {
+            callback(err);
+            return;
+        }
+
+        // TODO: make a class for this object - how to handle dates...?
+        var metadata = writeStream.toJSON();
+        metadata.lastModified = fileInfo.lastModified;
+
+        callback(null, metadataHash, metadata);
+    });
+};
+
+BlobBackendBase.prototype.listAllMetadata = function (all, callback) {
+    var self = this,
+        allMetadata = {};
+
+    all = all || false;
+
+    self.listObjects(self.metadataBucket, function (err, hashes) {
+        if (err) {
+            callback(err);
+            return;
+        }
+
+        var remaining = hashes.length,
+            getMetaDataResponse = function (err, hash, metadata) {
+                remaining -= 1;
+
+                if (err) {
+                    // concat error?
+                    return;
+                }
+
+                if (all || metadata.isPublic) {
+                    allMetadata[hash] = metadata;
+                }
+
+                if (remaining === 0) {
+                    callback(null, allMetadata);
+                }
+            };
+
+        if (hashes.length === 0) {
+            callback(null, allMetadata);
+        }
+
+        for (var i = 0; i < hashes.length; i += 1) {
+            self.getMetadata(hashes[i], getMetaDataResponse);
+        }
+    });
+};
+
+
+BlobBackendBase.prototype.test = function (/*callback*/) {
+    // TODO: write a randomly generated small binary file
+    // TODO: read it back by hash
+    // TODO: check if it is exactly the same
+    throw new Error('Not implemented yet.');
+};
+
+module.exports = BlobBackendBase;
